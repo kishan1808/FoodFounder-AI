@@ -24,3 +24,7 @@ Thumbs.db
 # Environment
 .env
 *.env
+
+# Local app state (persists session data across browser refreshes)
+.foodfounder_state.json
+.foodfounder_state.json.tmp

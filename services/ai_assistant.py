@@ -1,17 +1,22 @@
-"""LLM-backed food business assistant using the Google Gemini API.
+"""LLM-backed food business assistant using the Groq API.
 
 Kept separate from Streamlit so it can be unit-tested with a fake client.
 """
 
 import os
 
-DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
+DEFAULT_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
+
+REQUEST_TIMEOUT_SECONDS = 30
+
+MAX_RETRIES = 2
+MAX_OUTPUT_TOKENS = 2048
 
 MISSING_KEY_MESSAGE = (
-    "No API key configured. Get a free key at https://aistudio.google.com/apikey "
+    "No API key configured. Get a free key at https://console.groq.com/keys "
     "then either:\n"
-    "1) PowerShell (current session): `$env:GEMINI_API_KEY='your-key'` then restart the app, or\n"
-    "2) Add `GEMINI_API_KEY = 'your-key'` to `.streamlit/secrets.toml` "
+    "1) PowerShell (current session): `$env:GROQ_API_KEY='your-key'` then restart the app, or\n"
+    "2) Add `GROQ_API_KEY = 'your-key'` to `.streamlit/secrets.toml` "
     "(this file is ignored by Git) and restart the app."
 )
 
@@ -40,27 +45,35 @@ class AssistantError(Exception):
 
 
 def get_api_key():
-    key = os.environ.get("GEMINI_API_KEY", "").strip()
+    key = os.environ.get("GROQ_API_KEY", "").strip()
     if key:
         return key
     try:
         import streamlit as st
 
-        if "GEMINI_API_KEY" in st.secrets:
-            return str(st.secrets["GEMINI_API_KEY"]).strip()
+        if "GROQ_API_KEY" in st.secrets:
+            return str(st.secrets["GROQ_API_KEY"]).strip()
     except Exception:
         pass
     return None
 
 
 def build_message_history(history, message):
-    """Return the trimmed [(role, text), ...] turns, including the new user message."""
+    """Return the trimmed [(role, text), ...] turns, including the new user message.
+
+    Malformed history is tolerated: non-list history is treated as empty, and
+    entries that are not dicts or have no usable text are skipped.
+    """
     user_text = str(message or "").strip()
     if not user_text:
         raise AssistantError("Please type a message before sending.")
 
+    recent = history[-12:] if isinstance(history, (list, tuple)) else []
+
     turns = []
-    for turn in (history or [])[-12:]:
+    for turn in recent:
+        if not isinstance(turn, dict):
+            continue
         role = "user" if turn.get("role") == "user" else "model"
         text = str(turn.get("text") or "").strip()
         if text:
@@ -70,42 +83,92 @@ def build_message_history(history, message):
     return turns
 
 
+def _retry_after_seconds(exc):
+    """Return the Retry-After header (seconds) from an API error, if present."""
+    headers = getattr(getattr(exc, "response", None), "headers", None)
+    if headers is None:
+        return None
+    try:
+        value = headers.get("retry-after")
+    except Exception:
+        return None
+    if value in (None, ""):
+        return None
+    try:
+        seconds = int(str(value).strip())
+    except ValueError:
+        return None
+    return seconds if seconds >= 0 else None
+
+
 def _friendly_error(exc):
-    code = getattr(exc, "code", None)
+    code = getattr(exc, "status_code", None) or getattr(exc, "code", None)
     message = str(exc)
     lowered = message.lower()
 
-    if code == 429 or "429" in message or "resource_exhausted" in lowered or "rate limit" in lowered:
+    if code == 429 or "429" in message or "rate limit" in lowered:
+        retry_after = _retry_after_seconds(exc)
+        if retry_after is not None:
+            wait_hint = (
+                f"about {retry_after} seconds"
+                if retry_after < 120
+                else f"about {retry_after // 60} minutes"
+            )
+            return AssistantError(
+                "The AI service is rate-limited right now. "
+                f"The service suggests waiting {wait_hint} before trying again."
+            )
         return AssistantError(
-            "The AI service is rate-limited right now (free-tier limits apply). "
+            "The AI service is rate-limited right now. "
             "Wait about a minute and try again."
         )
     if "quota" in lowered:
         return AssistantError(
-            "Free-tier quota exceeded. Try again later, or check your limits in Google AI Studio."
+            "The AI service reported a quota limit. Try again later, or check your "
+            "usage and limits in the Groq console (https://console.groq.com)."
+        )
+    if code == 503 or "overloaded" in lowered or "unavailable" in lowered:
+        return AssistantError(
+            "The AI service is temporarily overloaded because of high demand. "
+            "This usually clears within a few minutes — please try again shortly."
         )
     if (
-        code in (400, 401, 403)
+        code in (401, 403)
+        or "invalid api key" in lowered
         or "api key" in lowered
-        or "api_key" in lowered
         or "unauthenticated" in lowered
-        or "permission_denied" in lowered
-        or "invalid argument" in lowered
+        or "permission" in lowered
     ):
         return AssistantError(
-            "The AI service rejected the request. Check that your GEMINI_API_KEY is "
-            "correct, active, and belongs to a Google AI Studio project."
+            "The AI service rejected the request. Check that your GROQ_API_KEY is "
+            "correct and active (get a key at https://console.groq.com/keys)."
+        )
+    if "timeout" in lowered or "timed out" in lowered or "deadline" in lowered:
+        return AssistantError(
+            f"The AI service did not respond within {REQUEST_TIMEOUT_SECONDS} seconds. "
+            "Check your internet connection and try again."
         )
     if (
-        "timeout" in lowered
-        or "timed out" in lowered
-        or "unreachable" in lowered
+        "unreachable" in lowered
         or "connection" in lowered
         or "temporary failure" in lowered
+        or "name or service not known" in lowered
+        or "getaddrinfo" in lowered
     ):
         return AssistantError(
             "Network problem while contacting the AI service. "
             "Check your internet connection and try again."
+        )
+    if (
+        code == 404
+        or "not found" in lowered
+        or "model_decommissioned" in lowered
+        or "decommissioned" in lowered
+    ):
+        return AssistantError(
+            f"The requested AI model was not found. Check the GROQ_MODEL setting "
+            f"(current default: {DEFAULT_MODEL}) and pick a current model from "
+            "https://console.groq.com/docs/models."
         )
     return AssistantError(f"The AI service returned an error: {message[:200]}")
 
@@ -120,14 +183,18 @@ def chat(message, history=None, product_context=None, api_key=None, model=None, 
 
     if client is None:
         try:
-            from google import genai
+            from groq import Groq
         except ImportError:
             raise AssistantError(
-                "The 'google-genai' package is not installed. "
-                "Run: .\\venv\\Scripts\\pip.exe install google-genai"
+                "The 'groq' package is not installed. "
+                "Run: .\\venv\\Scripts\\pip.exe install groq"
             )
         try:
-            client = genai.Client(api_key=key)
+            client = Groq(
+                api_key=key,
+                timeout=REQUEST_TIMEOUT_SECONDS,
+                max_retries=MAX_RETRIES,
+            )
         except Exception as exc:
             raise AssistantError(f"Could not start the AI client: {exc}") from exc
 
@@ -135,28 +202,27 @@ def chat(message, history=None, product_context=None, api_key=None, model=None, 
     if product_context:
         system_instruction += f"\n\nThe user's current product setup: {product_context}"
 
-    try:
-        from google.genai import types
+    messages = [{"role": "system", "content": system_instruction}]
+    messages.extend(
+        {"role": "user" if role == "user" else "assistant", "content": text}
+        for role, text in turns
+    )
 
-        contents = [
-            types.Content(role=role, parts=[types.Part.from_text(text=text)])
-            for role, text in turns
-        ]
-        response = client.models.generate_content(
+    try:
+        response = client.chat.completions.create(
             model=model or DEFAULT_MODEL,
-            contents=contents,
-            config=types.GenerateContentConfig(
-                system_instruction=system_instruction,
-                temperature=0.4,
-                max_output_tokens=2048,
-            ),
+            messages=messages,
+            max_completion_tokens=MAX_OUTPUT_TOKENS,
         )
     except AssistantError:
         raise
     except Exception as exc:
         raise _friendly_error(exc) from exc
 
-    text = getattr(response, "text", None)
+    text = None
+    choices = getattr(response, "choices", None)
+    if choices:
+        text = getattr(getattr(choices[0], "message", None), "content", None)
     if not text or not str(text).strip():
         raise AssistantError("The AI returned an empty response. Please try again.")
     return str(text).strip()

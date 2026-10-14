@@ -1,7 +1,7 @@
 import pandas as pd
 import streamlit as st
 
-from services import ai_assistant, guidance, report
+from services import ai_assistant, guidance, persistence, report
 from services.ai_assistant import AssistantError
 from services.calculator import CalculatorError, Ingredient, calculate_batch
 
@@ -10,6 +10,16 @@ st.set_page_config(
     page_icon="🍽️",
     layout="centered",
 )
+
+# Restore persisted state (product, calculator, chat) so a full browser
+# refresh does not lose data. Only fills keys that are missing, so a live
+# session's newer values always win over the saved file.
+try:
+    persistence.restore_session_state(st.session_state)
+except Exception:
+    pass
+
+PAGES = ["Home / Product Setup", "Cost Calculator", "AI Guidance"]
 
 PRODUCT_CATEGORIES = [
     "Snacks",
@@ -50,6 +60,21 @@ def load_example():
     }
 
 
+def build_pdf_summary(product, result):
+    """Return PDF bytes for the summary, or None if PDF generation is unavailable."""
+    builder = getattr(report, "build_pdf_report", None)
+    if builder is None:
+        return None
+    try:
+        return builder(
+            product=product,
+            result=result,
+            chat_history=st.session_state.get("chat_history"),
+        )
+    except Exception:
+        return None
+
+
 def page_home():
     st.title("🍽️ FoodFounder AI")
     st.subheader("An AI Assistant for Small-Scale Food Entrepreneurs")
@@ -71,18 +96,52 @@ def page_home():
     st.divider()
     st.markdown("### Step 1 — Set up your product")
 
-    with st.form("product_setup"):
-        name = st.text_input("Product name", placeholder="e.g. Banana Chips")
-        category = st.selectbox("Product category", PRODUCT_CATEGORIES)
+    saved_product = st.session_state.get("product") or {}
+    desired_name = str(saved_product.get("name") or "")
+    saved_category = saved_product.get("category")
+    category_index = (
+        PRODUCT_CATEGORIES.index(saved_category)
+        if saved_category in PRODUCT_CATEGORIES
+        else 0
+    )
+    saved_batch_size = saved_product.get("batch_size")
+    if not isinstance(saved_batch_size, (int, float)) or saved_batch_size <= 0:
+        saved_batch_size = 10.0
+    saved_batch_unit = saved_product.get("batch_unit")
+    unit_index = UNITS.index(saved_batch_unit) if saved_batch_unit in UNITS else 0
+    saved_budget = saved_product.get("budget")
+    if not isinstance(saved_budget, (int, float)) or saved_budget < 0:
+        saved_budget = 5000.0
+
+    # Re-key the form whenever the saved product name changes so the widgets
+    # re-initialize from the saved values (avoids stale widget state).
+    if st.session_state.get("_product_form_name") != desired_name:
+        st.session_state["_product_form_name"] = desired_name
+        st.session_state["_product_form_version"] = (
+            st.session_state.get("_product_form_version", 0) + 1
+        )
+    form_key = f"product_setup_{st.session_state.get('_product_form_version', 0)}"
+
+    with st.form(form_key):
+        name = st.text_input(
+            "Product name",
+            value=desired_name,
+            placeholder="e.g. Banana Chips",
+        )
+        category = st.selectbox(
+            "Product category", PRODUCT_CATEGORIES, index=category_index
+        )
         col1, col2 = st.columns(2)
         with col1:
-            batch_size = st.number_input("Batch size", min_value=0.0, value=10.0, step=1.0)
+            batch_size = st.number_input(
+                "Batch size", min_value=0.0, value=float(saved_batch_size), step=1.0
+            )
         with col2:
-            batch_unit = st.selectbox("Batch unit", UNITS, index=0)
+            batch_unit = st.selectbox("Batch unit", UNITS, index=unit_index)
         budget = st.number_input(
             "Approximate budget for this batch (INR, optional)",
             min_value=0.0,
-            value=5000.0,
+            value=float(saved_budget),
             step=100.0,
         )
         submitted = st.form_submit_button("Start", type="primary")
@@ -116,6 +175,21 @@ def page_home():
 def page_calculator():
     st.title("💰 Cost Calculator")
     st.caption("Estimates only — actual costs may vary with wastage, taxes, transport, and retailer margins.")
+
+    # Ensure calculator input widget keys exist (restored values win; these
+    # defaults only apply on the very first run). Keys are set before the
+    # widgets are created so no default/value conflict warning is raised.
+    _input_defaults = {
+        "packaging_cost": 150.0,
+        "labour_cost": 200.0,
+        "energy_cost": 100.0,
+        "other_cost": 50.0,
+        "saleable_packets": 40,
+        "selling_price": 50.0,
+    }
+    for _key, _default in _input_defaults.items():
+        if _key not in st.session_state:
+            st.session_state[_key] = _default
 
     product = st.session_state.get("product")
 
@@ -165,22 +239,35 @@ def page_calculator():
             ),
         },
     )
+    st.session_state["ingredients_df"] = edited
 
     st.markdown("### Other production expenses")
     col1, col2 = st.columns(2)
     with col1:
-        packaging_cost = st.number_input("Packaging cost (₹)", min_value=0.0, value=150.0, step=10.0)
-        labour_cost = st.number_input("Labour cost (₹)", min_value=0.0, value=200.0, step=10.0)
+        packaging_cost = st.number_input(
+            "Packaging cost (₹)", key="packaging_cost", min_value=0.0, step=10.0
+        )
+        labour_cost = st.number_input(
+            "Labour cost (₹)", key="labour_cost", min_value=0.0, step=10.0
+        )
     with col2:
-        energy_cost = st.number_input("Energy cost (₹)", min_value=0.0, value=100.0, step=10.0)
-        other_cost = st.number_input("Other expenses (₹)", min_value=0.0, value=50.0, step=10.0)
+        energy_cost = st.number_input(
+            "Energy cost (₹)", key="energy_cost", min_value=0.0, step=10.0
+        )
+        other_cost = st.number_input(
+            "Other expenses (₹)", key="other_cost", min_value=0.0, step=10.0
+        )
 
     st.markdown("### Sales assumptions")
     col1, col2 = st.columns(2)
     with col1:
-        saleable_packets = st.number_input("Number of saleable packets", min_value=1, value=40, step=1)
+        saleable_packets = st.number_input(
+            "Number of saleable packets", key="saleable_packets", min_value=1, step=1
+        )
     with col2:
-        selling_price = st.number_input("Selling price per packet (₹)", min_value=0.0, value=50.0, step=1.0)
+        selling_price = st.number_input(
+            "Selling price per packet (₹)", key="selling_price", min_value=0.0, step=1.0
+        )
 
     col1, col2 = st.columns([1, 1])
     calculate_clicked = col1.button("Calculate costs", type="primary")
@@ -274,6 +361,19 @@ def page_calculator():
             result=result,
             chat_history=st.session_state.get("chat_history"),
         )
+        summary_pdf = build_pdf_summary(product, result)
+        if summary_pdf is not None:
+            st.download_button(
+                "📄 Download product development summary (PDF)",
+                data=summary_pdf,
+                file_name="foodfounder_summary.pdf",
+                mime="application/pdf",
+                key="download_report_pdf_calculator",
+                type="primary",
+                width="stretch",
+            )
+        else:
+            st.caption("PDF export is unavailable in this session; Markdown download is below.")
         st.download_button(
             "📥 Download product development summary (Markdown)",
             data=summary_text,
@@ -303,16 +403,16 @@ def page_ai():
             st.warning("No API key found yet. Follow the steps below.")
         st.markdown(
             """
-            FoodFounder AI uses the **Google Gemini API free tier** (no credit card needed).
+            FoodFounder AI uses the **Groq API** (free developer tier available).
 
-            1. Get a free key: https://aistudio.google.com/apikey
+            1. Get a free key: https://console.groq.com/keys
             2. Either add it to `.streamlit/secrets.toml` (already ignored by Git):
                ```toml
-               GEMINI_API_KEY = "paste-your-key-here"
+               GROQ_API_KEY = "paste-your-key-here"
                ```
                or set it in PowerShell for the current session only:
                ```powershell
-               $env:GEMINI_API_KEY = "paste-your-key-here"
+               $env:GROQ_API_KEY = "paste-your-key-here"
                ```
             3. Fully restart the app (`Ctrl+C`, then `streamlit run app.py`).
             """
@@ -359,8 +459,19 @@ def page_ai():
         st.rerun()
 
     question = st.session_state.pop("pending_question", None)
+    typed_question = st.chat_input("Ask about formulation, packaging, processing, costing...")
     if question is None:
-        question = st.chat_input("Ask about formulation, packaging, processing, costing...")
+        question = typed_question
+
+    if question:
+        history = st.session_state["chat_history"]
+        if (
+            len(history) >= 2
+            and history[-1]["role"] == "model"
+            and history[-2]["role"] == "user"
+            and history[-2]["text"] == question
+        ):
+            question = None
 
     if question:
         st.session_state["chat_history"].append({"role": "user", "text": question})
@@ -411,6 +522,19 @@ def page_ai():
         result=result,
         chat_history=st.session_state.get("chat_history"),
     )
+    summary_pdf = build_pdf_summary(product, result)
+    if summary_pdf is not None:
+        st.download_button(
+            "📄 Download summary (PDF)",
+            data=summary_pdf,
+            file_name="foodfounder_summary.pdf",
+            mime="application/pdf",
+            key="download_report_pdf_ai",
+            type="primary",
+            width="stretch",
+        )
+    else:
+        st.caption("PDF export is unavailable in this session; Markdown download is below.")
     st.download_button(
         "📥 Download summary (Markdown)",
         data=summary_text,
@@ -423,17 +547,65 @@ def page_ai():
         st.markdown(summary_text)
 
 
+# --- Navigation (URL query param keeps the page across browser refresh) ---
+# The URL is the source of truth: it survives a refresh and reflects
+# back/forward. We only adopt a URL value that differs from the last one we
+# observed, so a user click (handled by on_change) is never clobbered.
+url_page = st.query_params.get("page")
+_seen_url = st.session_state.get("_nav_url_seen")
+
+if url_page in PAGES and url_page != _seen_url:
+    # URL changed externally (refresh restored it, or back/forward) — adopt it.
+    st.session_state["nav_page"] = url_page
+    st.session_state["_nav_url_seen"] = url_page
+elif "nav_page" not in st.session_state:
+    # First run in this session with no usable URL param — default to Home.
+    st.session_state["nav_page"] = PAGES[0]
+
+
+def _sync_nav_to_url():
+    new_page = st.session_state.get("nav_page")
+    if new_page in PAGES:
+        st.session_state["_nav_url_seen"] = new_page
+        st.query_params["page"] = new_page
+
+
 st.sidebar.title("🍽️ FoodFounder AI")
 st.sidebar.caption("AI assistant for small-scale food entrepreneurs")
 page = st.sidebar.radio(
     "Go to",
-    ["Home / Product Setup", "Cost Calculator", "AI Guidance"],
+    PAGES,
+    key="nav_page",
     label_visibility="collapsed",
+    on_change=_sync_nav_to_url,
 )
 st.sidebar.divider()
 product = st.session_state.get("product")
 if product:
     st.sidebar.markdown(f"**Current product**\n\n{product['name']} ({product['category']})")
+
+# Keep the URL in sync (covers first visit and any missed callback).
+if st.query_params.get("page") != page:
+    st.query_params["page"] = page
+    st.session_state["_nav_url_seen"] = page
+
+# One-shot scroll-to-top when (and only when) the page actually changes.
+# Streamlit never resets browser scroll on reruns or page changes (reruns
+# patch the DOM in place and page switches use history.pushState), so the
+# browser keeps the old scroll offset when switching pages — e.g. Cost
+# Calculator -> AI Guidance opened near the bottom of the new page.
+# st.html(..., unsafe_allow_javascript=True) is a first-class, non-iframed
+# Streamlit API that executes the script once. The gate keeps mid-task
+# reruns (calculate, save, chat) from scrolling, and setdefault leaves the
+# session's first run alone (fresh load is already at the top; a browser
+# refresh keeps its native scroll restore).
+st.session_state.setdefault("_scrolled_page", page)
+if st.session_state["_scrolled_page"] != page:
+    st.html(
+        f"<script>window.scrollTo(0, 0); /* nav:{page} */</script>",
+        unsafe_allow_javascript=True,
+    )
+    st.session_state["_scrolled_page"] = page
 
 if page == "Home / Product Setup":
     page_home()
@@ -441,3 +613,9 @@ elif page == "Cost Calculator":
     page_calculator()
 else:
     page_ai()
+
+# --- Persist state so a browser refresh can restore it ---
+try:
+    persistence.save_state(persistence.capture_session_state(st.session_state))
+except Exception:
+    pass

@@ -136,5 +136,125 @@ class TestBatchCalculation(unittest.TestCase):
         self.assertAlmostEqual(result.batch_profit, 0.0)
 
 
+class TestEdgeCases(unittest.TestCase):
+    """Edge cases uncovered by the original suite."""
+
+    def base_batch(self, **overrides):
+        params = dict(
+            product_name="X",
+            product_category="Snacks",
+            batch_size=1.0,
+            batch_unit="kg",
+            ingredients=[Ingredient("A", 1.0, "kg", 10.0)],
+            packaging_cost=0.0,
+            labour_cost=0.0,
+            energy_cost=0.0,
+            other_cost=0.0,
+            saleable_packets=1,
+            selling_price=20.0,
+        )
+        params.update(overrides)
+        return calculate_batch(**params)
+
+    def test_infinite_packets_rejected_not_crash(self):
+        """float('inf') must raise CalculatorError, not OverflowError."""
+        with self.assertRaises(CalculatorError):
+            self.base_batch(saleable_packets=float("inf"))
+
+    def test_boolean_true_packets_rejected(self):
+        """bool subclasses int in Python; True must not be accepted as 1 packet."""
+        with self.assertRaises(CalculatorError):
+            self.base_batch(saleable_packets=True)
+
+    def test_boolean_false_packets_rejected(self):
+        with self.assertRaises(CalculatorError):
+            self.base_batch(saleable_packets=False)
+
+    def test_ordinary_int_packets_accepted(self):
+        result = self.base_batch(saleable_packets=25)
+        self.assertEqual(result.saleable_packets, 25)
+        self.assertAlmostEqual(result.cost_per_packet, 10.0 / 25)
+
+    def test_nan_packets_rejected(self):
+        with self.assertRaises(CalculatorError):
+            self.base_batch(saleable_packets=float("nan"))
+
+    def test_string_packets_whole_number_accepted(self):
+        result = self.base_batch(saleable_packets="40")
+        self.assertEqual(result.saleable_packets, 40)
+
+    def test_string_packets_non_numeric_rejected(self):
+        with self.assertRaises(CalculatorError):
+            self.base_batch(saleable_packets="abc")
+
+    def test_whole_float_packets_accepted(self):
+        result = self.base_batch(saleable_packets=40.0)
+        self.assertEqual(result.saleable_packets, 40)
+
+    def test_infinite_selling_price_rejected(self):
+        with self.assertRaises(CalculatorError):
+            self.base_batch(selling_price=float("inf"))
+
+    def test_infinite_ingredient_quantity_rejected(self):
+        with self.assertRaises(CalculatorError):
+            self.base_batch(ingredients=[Ingredient("A", float("inf"), "kg", 10.0)])
+
+    def test_nan_ingredient_price_rejected(self):
+        with self.assertRaises(CalculatorError):
+            self.base_batch(ingredients=[Ingredient("A", 1.0, "kg", float("nan"))])
+
+    def test_negative_batch_size_rejected(self):
+        with self.assertRaises(CalculatorError):
+            self.base_batch(batch_size=-5)
+
+    def test_infinite_batch_size_rejected(self):
+        with self.assertRaises(CalculatorError):
+            self.base_batch(batch_size=float("inf"))
+
+    def test_huge_packet_count_still_divides(self):
+        result = self.base_batch(saleable_packets=10**6)
+        self.assertAlmostEqual(result.cost_per_packet, 10.0 / 10**6)
+
+    def test_tiny_quantity_still_costs(self):
+        result = self.base_batch(
+            ingredients=[Ingredient("A", 0.001, "kg", 10.0)],
+            saleable_packets=1,
+        )
+        self.assertAlmostEqual(result.total_ingredient_cost, 0.01)
+
+    def test_unit_mismatch_is_not_converted(self):
+        """Units are labels only; calculator does not convert kg to L."""
+        result = self.base_batch(ingredients=[Ingredient("A", 2.0, "L", 50.0)])
+        self.assertAlmostEqual(result.total_ingredient_cost, 100.0)
+
+    def test_mixed_units_summed_as_entered(self):
+        result = self.base_batch(
+            ingredients=[
+                Ingredient("A", 1.0, "kg", 10.0),
+                Ingredient("B", 2.0, "L", 5.0),
+                Ingredient("C", 3.0, "pieces", 1.0),
+            ]
+        )
+        self.assertAlmostEqual(result.total_ingredient_cost, 10.0 + 10.0 + 3.0)
+
+    def test_batch_size_does_not_affect_cost(self):
+        """Batch size is informational; cost math uses quantities and packets."""
+        small = self.base_batch(batch_size=1.0)
+        large = self.base_batch(batch_size=100.0)
+        self.assertAlmostEqual(small.total_production_cost, large.total_production_cost)
+        self.assertAlmostEqual(small.cost_per_packet, large.cost_per_packet)
+
+    def test_no_rounding_in_result(self):
+        """Internal results keep full float precision; UI rounds for display."""
+        result = self.base_batch(ingredients=[Ingredient("A", 0.1, "kg", 0.2)])
+        self.assertAlmostEqual(result.total_ingredient_cost, 0.02, places=12)
+
+    def test_margin_none_only_when_price_zero(self):
+        zero = self.base_batch(selling_price=0.0)
+        paid = self.base_batch(selling_price=0.01)
+        self.assertIsNone(zero.profit_margin_pct)
+        self.assertIsNotNone(paid.profit_margin_pct)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -119,9 +119,14 @@ def calculate_batch(
     energy = _require_finite_number(energy_cost, "Energy cost")
     other = _require_finite_number(other_cost, "Other production cost")
 
+    if isinstance(saleable_packets, bool):
+        raise CalculatorError(
+            f"Saleable packets must be a whole number, not a True/False value (got {saleable_packets!r})."
+        )
+
     try:
         packets = int(saleable_packets)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         raise CalculatorError(f"Saleable packets must be a whole number (got {saleable_packets!r}).")
 
     if float(saleable_packets) != packets:
