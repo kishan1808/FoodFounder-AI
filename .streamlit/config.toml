@@ -1,0 +1,5 @@
+# Streamlit configuration for FoodFounder AI
+# This file is safe to commit (no secrets). Secrets go in .streamlit/secrets.toml (gitignored).
+
+[theme]
+base = "light"
