@@ -1,39 +1,80 @@
-"""Unit tests for services/persistence.py (local JSON state save/restore)."""
+"""Unit tests for services/persistence.py (per-session JSON state save/restore)."""
 
 import json
 import os
+import shutil
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
 from services.calculator import CostResult, Ingredient
 from services.persistence import (
+    MAX_SESSION_FILES,
     SCHEMA_VERSION,
     capture_session_state,
     has_content,
+    is_valid_session_id,
     load_state,
     restore_session_state,
     save_state,
+    valid_session_id,
 )
 
+VALID_SID = "sess-test-00000001"
+OTHER_SID = "sess-test-00000002"
 
-class _TempStatePath(unittest.TestCase):
-    """Base: each test gets its own temp state file path (deleted on teardown)."""
+
+class _TempSessionsDir(unittest.TestCase):
+    """Base: each test gets its own temp sessions dir (FOODFOUNDER_SESSIONS_DIR)."""
 
     def setUp(self):
-        fd, self.path = tempfile.mkstemp(suffix=".json", prefix="ff_persist_test_")
-        os.close(fd)
-        os.unlink(self.path)  # start with no file
+        self.sessions_dir = tempfile.mkdtemp(prefix="ff_sessions_test_")
+        self._old_env = os.environ.get("FOODFOUNDER_SESSIONS_DIR")
+        os.environ["FOODFOUNDER_SESSIONS_DIR"] = self.sessions_dir
 
     def tearDown(self):
-        for p in (self.path, self.path + ".tmp"):
-            if os.path.exists(p):
-                os.unlink(p)
+        if self._old_env is None:
+            os.environ.pop("FOODFOUNDER_SESSIONS_DIR", None)
+        else:
+            os.environ["FOODFOUNDER_SESSIONS_DIR"] = self._old_env
+        shutil.rmtree(self.sessions_dir, ignore_errors=True)
+
+    def sid_path(self, sid):
+        return Path(self.sessions_dir) / f"{sid}.json"
+
+    def write_raw(self, sid, text):
+        path = self.sid_path(sid)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        return path
 
 
-class TestLoadState(_TempStatePath):
+class TestSessionIdValidation(unittest.TestCase):
+    def test_valid_ids(self):
+        self.assertTrue(is_valid_session_id("sess-test-00000001"))
+        self.assertTrue(is_valid_session_id("a" * 16))
+        self.assertTrue(is_valid_session_id("a" * 64))
+        self.assertTrue(is_valid_session_id("AbCdEfGh_12345678"))
+
+    def test_invalid_ids(self):
+        self.assertFalse(is_valid_session_id(None))
+        self.assertFalse(is_valid_session_id(""))
+        self.assertFalse(is_valid_session_id("short"))  # under 16 chars
+        self.assertFalse(is_valid_session_id("a" * 65))  # over 64 chars
+        self.assertFalse(is_valid_session_id("sid with spaces!!"))
+        self.assertFalse(is_valid_session_id("sid/../traversal"))
+        self.assertFalse(is_valid_session_id("sid\\windows\\path"))
+
+    def test_valid_session_id_helper(self):
+        self.assertEqual(valid_session_id(VALID_SID), VALID_SID)
+        self.assertIsNone(valid_session_id("bad"))
+        self.assertIsNone(valid_session_id(None))
+
+
+class TestLoadState(_TempSessionsDir):
     def test_missing_file_returns_empty_defaults(self):
-        state = load_state(self.path)
+        state = load_state(VALID_SID)
         self.assertEqual(state["version"], SCHEMA_VERSION)
         self.assertIsNone(state["product"])
         self.assertIsNone(state["ingredients"])
@@ -42,26 +83,30 @@ class TestLoadState(_TempStatePath):
         self.assertIsNone(state["chat_history"])
 
     def test_empty_file_returns_empty_defaults(self):
-        Path(self.path).write_text("", encoding="utf-8")
-        state = load_state(self.path)
+        self.write_raw(VALID_SID, "")
+        state = load_state(VALID_SID)
         self.assertIsNone(state["product"])
 
     def test_malformed_json_returns_empty_defaults(self):
-        Path(self.path).write_text("{not valid json", encoding="utf-8")
-        state = load_state(self.path)
+        self.write_raw(VALID_SID, "{not valid json")
+        state = load_state(VALID_SID)
         self.assertIsNone(state["product"])
         self.assertIsNone(state["chat_history"])
 
     def test_non_dict_json_returns_empty_defaults(self):
-        Path(self.path).write_text("[1, 2, 3]", encoding="utf-8")
-        state = load_state(self.path)
+        self.write_raw(VALID_SID, "[1, 2, 3]")
+        state = load_state(VALID_SID)
         self.assertIsNone(state["product"])
 
     def test_wrong_version_returns_empty_defaults(self):
         payload = {"version": 999, "product": {"name": "X", "batch_size": 1}}
-        Path(self.path).write_text(json.dumps(payload), encoding="utf-8")
-        state = load_state(self.path)
+        self.write_raw(VALID_SID, json.dumps(payload))
+        state = load_state(VALID_SID)
         self.assertIsNone(state["product"])
+
+    def test_invalid_sid_returns_empty_defaults(self):
+        self.assertEqual(load_state("bad")["product"], None)
+        self.assertEqual(load_state(None)["product"], None)
 
     def test_valid_product_roundtrip(self):
         product = {
@@ -71,8 +116,8 @@ class TestLoadState(_TempStatePath):
             "batch_unit": "kg",
             "budget": 5000.0,
         }
-        self.assertTrue(save_state({"product": product}, self.path))
-        state = load_state(self.path)
+        self.assertTrue(save_state({"product": product}, VALID_SID))
+        state = load_state(VALID_SID)
         self.assertEqual(state["product"], product)
 
     def test_invalid_product_dropped(self):
@@ -80,8 +125,8 @@ class TestLoadState(_TempStatePath):
             "version": SCHEMA_VERSION,
             "product": {"name": "", "batch_size": 10},  # empty name -> invalid
         }
-        Path(self.path).write_text(json.dumps(payload), encoding="utf-8")
-        state = load_state(self.path)
+        self.write_raw(VALID_SID, json.dumps(payload))
+        state = load_state(VALID_SID)
         self.assertIsNone(state["product"])
 
     def test_product_with_bad_batch_dropped(self):
@@ -89,8 +134,8 @@ class TestLoadState(_TempStatePath):
             "version": SCHEMA_VERSION,
             "product": {"name": "X", "batch_size": -5},
         }
-        Path(self.path).write_text(json.dumps(payload), encoding="utf-8")
-        state = load_state(self.path)
+        self.write_raw(VALID_SID, json.dumps(payload))
+        state = load_state(VALID_SID)
         self.assertIsNone(state["product"])
 
     def test_chat_history_order_preserved_and_invalid_dropped(self):
@@ -102,8 +147,8 @@ class TestLoadState(_TempStatePath):
             {"role": "model", "text": "a2"},
             {"role": "weird", "text": "a3"},  # role normalized to model
         ]
-        self.assertTrue(save_state({"chat_history": history}, self.path))
-        state = load_state(self.path)
+        self.assertTrue(save_state({"chat_history": history}, VALID_SID))
+        state = load_state(VALID_SID)
         self.assertEqual(
             state["chat_history"],
             [
@@ -123,8 +168,8 @@ class TestLoadState(_TempStatePath):
             "saleable_packets": 40.5,  # not whole -> dropped
             "selling_price": 50.0,
         }
-        self.assertTrue(save_state({"calculator_inputs": inputs}, self.path))
-        state = load_state(self.path)
+        self.assertTrue(save_state({"calculator_inputs": inputs}, VALID_SID))
+        state = load_state(VALID_SID)
         self.assertEqual(
             state["calculator_inputs"],
             {"packaging_cost": 150.0, "other_cost": 50.0, "selling_price": 50.0},
@@ -151,8 +196,8 @@ class TestLoadState(_TempStatePath):
             profit_margin_pct=55.0,
             batch_profit=1100.0,
         )
-        self.assertTrue(save_state({"cost_result": result}, self.path))
-        state = load_state(self.path)
+        self.assertTrue(save_state({"cost_result": result}, VALID_SID))
+        state = load_state(VALID_SID)
         restored = state["cost_result"]
         self.assertIsInstance(restored, CostResult)
         self.assertEqual(restored.product_name, "Chips")
@@ -182,21 +227,21 @@ class TestLoadState(_TempStatePath):
             profit_margin_pct=None,
             batch_profit=0.0,
         )
-        self.assertTrue(save_state({"cost_result": result}, self.path))
-        state = load_state(self.path)
+        self.assertTrue(save_state({"cost_result": result}, VALID_SID))
+        state = load_state(VALID_SID)
         self.assertIsNone(state["cost_result"].profit_margin_pct)
 
     def test_malformed_cost_result_dropped(self):
         payload = {"version": SCHEMA_VERSION, "cost_result": {"product_name": "X"}}
-        Path(self.path).write_text(json.dumps(payload), encoding="utf-8")
-        state = load_state(self.path)
+        self.write_raw(VALID_SID, json.dumps(payload))
+        state = load_state(VALID_SID)
         self.assertIsNone(state["cost_result"])
 
 
-class TestSaveState(_TempStatePath):
+class TestSaveState(_TempSessionsDir):
     def test_save_skipped_when_empty(self):
-        self.assertFalse(save_state({}, self.path))
-        self.assertFalse(os.path.exists(self.path))
+        self.assertFalse(save_state({}, VALID_SID))
+        self.assertFalse(self.sid_path(VALID_SID).exists())
 
     def test_save_skipped_when_all_none(self):
         data = {
@@ -206,13 +251,23 @@ class TestSaveState(_TempStatePath):
             "cost_result": None,
             "chat_history": None,
         }
-        self.assertFalse(save_state(data, self.path))
-        self.assertFalse(os.path.exists(self.path))
+        self.assertFalse(save_state(data, VALID_SID))
+        self.assertFalse(self.sid_path(VALID_SID).exists())
 
     def test_save_creates_file_atomically(self):
-        self.assertTrue(save_state({"product": {"name": "X", "batch_size": 1}}, self.path))
-        self.assertTrue(os.path.exists(self.path))
-        self.assertFalse(os.path.exists(self.path + ".tmp"))
+        self.assertTrue(
+            save_state({"product": {"name": "X", "batch_size": 1}}, VALID_SID)
+        )
+        self.assertTrue(self.sid_path(VALID_SID).exists())
+        self.assertFalse(self.sid_path(VALID_SID).with_suffix(".json.tmp").exists())
+
+    def test_save_rejects_invalid_sid(self):
+        self.assertFalse(
+            save_state({"product": {"name": "X", "batch_size": 1}}, "bad")
+        )
+        self.assertFalse(save_state({"product": {"name": "X", "batch_size": 1}}, None))
+        # No stray files created anywhere in the temp dir.
+        self.assertEqual(list(Path(self.sessions_dir).glob("*.json")), [])
 
     def test_has_content(self):
         self.assertFalse(has_content({}))
@@ -221,31 +276,111 @@ class TestSaveState(_TempStatePath):
         self.assertTrue(has_content({"chat_history": [{"role": "user", "text": "hi"}]}))
 
 
-class TestSessionBridge(_TempStatePath):
+class TestSessionIsolation(_TempSessionsDir):
+    def test_two_sids_save_and_load_independently(self):
+        self.assertTrue(
+            save_state({"product": {"name": "Alpha", "batch_size": 1}}, VALID_SID)
+        )
+        self.assertTrue(
+            save_state({"product": {"name": "Beta", "batch_size": 2}}, OTHER_SID)
+        )
+        self.assertEqual(load_state(VALID_SID)["product"]["name"], "Alpha")
+        self.assertEqual(load_state(OTHER_SID)["product"]["name"], "Beta")
+
+    def test_saving_one_sid_does_not_touch_another(self):
+        self.assertTrue(
+            save_state({"product": {"name": "Alpha", "batch_size": 1}}, VALID_SID)
+        )
+        mtime_before = self.sid_path(VALID_SID).stat().st_mtime_ns
+        self.assertTrue(
+            save_state({"chat_history": [{"role": "user", "text": "hi"}]}, OTHER_SID)
+        )
+        self.assertEqual(self.sid_path(VALID_SID).stat().st_mtime_ns, mtime_before)
+
+    def test_restore_only_sees_own_sessions_data(self):
+        self.assertTrue(
+            save_state(
+                {"product": {"name": "Alpha", "batch_size": 1},
+                 "chat_history": [{"role": "user", "text": "from alpha"}]},
+                VALID_SID,
+            )
+        )
+        session = {}
+        restore_session_state(session, OTHER_SID)
+        self.assertEqual(session, {})
+        restore_session_state(session, VALID_SID)
+        self.assertEqual(session["product"]["name"], "Alpha")
+        self.assertEqual(session["chat_history"][0]["text"], "from alpha")
+
+    def test_prune_keeps_newest_sessions(self):
+        total = MAX_SESSION_FILES + 5
+        base = int(time.time()) - total
+        for index in range(total):
+            sid = f"prune-sid-{index:04d}-abcdefgh"
+            path = self.sid_path(sid)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("{}", encoding="utf-8")
+            os.utime(path, (base + index, base + index))
+        self.assertTrue(
+            save_state({"product": {"name": "Newest", "batch_size": 1}}, VALID_SID)
+        )
+        remaining = list(Path(self.sessions_dir).glob("*.json"))
+        self.assertLessEqual(len(remaining), MAX_SESSION_FILES)
+        self.assertTrue(self.sid_path(VALID_SID).exists())  # newest survives
+        self.assertTrue(
+            self.sid_path(f"prune-sid-{total - 1:04d}-abcdefgh").exists()
+        )  # second-newest survives
+        self.assertFalse(self.sid_path("prune-sid-0000-abcdefgh").exists())
+
+
+class TestSessionBridge(_TempSessionsDir):
     def test_restore_populates_missing_keys(self):
-        product = {"name": "Chips", "category": "Snacks", "batch_size": 5.0, "batch_unit": "kg", "budget": 100.0}
+        product = {
+            "name": "Chips",
+            "category": "Snacks",
+            "batch_size": 5.0,
+            "batch_unit": "kg",
+            "budget": 100.0,
+        }
         chat = [{"role": "user", "text": "q"}, {"role": "model", "text": "a"}]
-        save_state({"product": product, "chat_history": chat}, self.path)
+        save_state({"product": product, "chat_history": chat}, VALID_SID)
 
         session = {}
-        restore_session_state(session, self.path)
+        restore_session_state(session, VALID_SID)
         self.assertEqual(session["product"], product)
         self.assertEqual(session["chat_history"], chat)
 
     def test_restore_does_not_overwrite_existing(self):
-        save_state({"product": {"name": "FromFile", "batch_size": 5.0}}, self.path)
+        save_state({"product": {"name": "FromFile", "batch_size": 5.0}}, VALID_SID)
         session = {"product": {"name": "InSession", "batch_size": 9.0}}
-        restore_session_state(session, self.path)
+        restore_session_state(session, VALID_SID)
         self.assertEqual(session["product"]["name"], "InSession")
+
+    def test_restore_with_invalid_sid_is_noop(self):
+        save_state({"product": {"name": "Alpha", "batch_size": 1}}, VALID_SID)
+        session = {"existing": True}
+        restore_session_state(session, "bad")
+        restore_session_state(session, None)
+        self.assertEqual(session, {"existing": True})
 
     def test_restore_seeds_ingredients_dataframe(self):
         rows = [
-            {"Ingredient": "Banana", "Quantity": 10.0, "Unit": "kg", "Price per unit (INR)": 40.0},
-            {"Ingredient": "Oil", "Quantity": 2.0, "Unit": "L", "Price per unit (INR)": 150.0},
+            {
+                "Ingredient": "Banana",
+                "Quantity": 10.0,
+                "Unit": "kg",
+                "Price per unit (INR)": 40.0,
+            },
+            {
+                "Ingredient": "Oil",
+                "Quantity": 2.0,
+                "Unit": "L",
+                "Price per unit (INR)": 150.0,
+            },
         ]
-        save_state({"ingredients": rows}, self.path)
+        save_state({"ingredients": rows}, VALID_SID)
         session = {}
-        restore_session_state(session, self.path)
+        restore_session_state(session, VALID_SID)
         self.assertIn("ingredients_df", session)
         self.assertIn("ingredients_seed", session)
         self.assertEqual(len(session["ingredients_df"]), 2)
@@ -260,9 +395,9 @@ class TestSessionBridge(_TempStatePath):
             "saleable_packets": 30,
             "selling_price": 45.0,
         }
-        save_state({"calculator_inputs": inputs}, self.path)
+        save_state({"calculator_inputs": inputs}, VALID_SID)
         session = {}
-        restore_session_state(session, self.path)
+        restore_session_state(session, VALID_SID)
         self.assertEqual(session["packaging_cost"], 250.0)
         self.assertEqual(session["saleable_packets"], 30)
         self.assertEqual(session["selling_price"], 45.0)
@@ -289,17 +424,23 @@ class TestSessionBridge(_TempStatePath):
             batch_profit=1100.0,
         )
         session = {
-            "product": {"name": "Chips", "category": "Snacks", "batch_size": 10.0, "batch_unit": "kg", "budget": 5000.0},
+            "product": {
+                "name": "Chips",
+                "category": "Snacks",
+                "batch_size": 10.0,
+                "batch_unit": "kg",
+                "budget": 5000.0,
+            },
             "chat_history": [{"role": "user", "text": "q"}, {"role": "model", "text": "a"}],
             "cost_result": result,
             "packaging_cost": 150.0,
             "saleable_packets": 40,
         }
         data = capture_session_state(session)
-        self.assertTrue(save_state(data, self.path))
+        self.assertTrue(save_state(data, VALID_SID))
 
         restored = {}
-        restore_session_state(restored, self.path)
+        restore_session_state(restored, VALID_SID)
         self.assertEqual(restored["product"]["name"], "Chips")
         self.assertEqual(len(restored["chat_history"]), 2)
         self.assertEqual(restored["cost_result"].total_production_cost, 900.0)
@@ -311,9 +452,9 @@ class TestSessionBridge(_TempStatePath):
         self.assertIsNone(data["ingredients"])
 
     def test_restore_with_malformed_file_leaves_session_empty(self):
-        Path(self.path).write_text("garbage", encoding="utf-8")
+        self.write_raw(VALID_SID, "garbage")
         session = {}
-        restore_session_state(session, self.path)
+        restore_session_state(session, VALID_SID)
         self.assertEqual(session, {})
 
 

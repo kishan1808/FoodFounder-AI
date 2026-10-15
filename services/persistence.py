@@ -1,11 +1,14 @@
-"""Local JSON persistence for FoodFounder AI single-user session data.
+"""Local JSON persistence for FoodFounder AI, isolated per browser session.
 
-Saves product setup, ingredient rows, calculator inputs, the last calculation
-result, and AI chat history to a small JSON file so data survives a full
-browser refresh (Streamlit session_state alone is in-memory and is lost).
+Each browser tab session gets its own session id (carried in the URL ``sid``
+query parameter, seeded from ``sessionStorage`` by app.py). State is stored
+one file per session so a refresh restores that session's data while a new
+tab/session starts fresh and can never read or overwrite another session.
 
-File location: ``.foodfounder_state.json`` next to ``app.py`` (project root).
-Override with the ``FOODFOUNDER_STATE_FILE`` environment variable (used by tests).
+File location: ``.foodfounder_sessions/<sid>.json`` next to ``app.py``.
+Override the directory with the ``FOODFOUNDER_SESSIONS_DIR`` environment
+variable (used by tests). The legacy global ``.foodfounder_state.json`` from
+older builds is never read, written, or deleted.
 
 Schema (version 1)::
 
@@ -20,19 +23,25 @@ Schema (version 1)::
     }
 
 Recovery behaviour: a missing, empty, malformed, or wrong-version file loads
-as empty defaults (the app simply starts fresh). Saves are atomic and are
+as empty defaults (the session simply starts fresh). Saves are atomic and are
 skipped when there is nothing meaningful to store, so a valid saved file is
-never overwritten with empty defaults. No API keys or secrets are ever stored.
+never overwritten with empty defaults. Old session files are pruned to the
+most recent MAX_SESSION_FILES. No API keys or secrets are ever stored.
 """
 
 import json
 import math
 import os
+import re
 from pathlib import Path
 
 from services.calculator import CostResult, Ingredient
 
 SCHEMA_VERSION = 1
+
+MAX_SESSION_FILES = 20
+
+SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{16,64}$")
 
 INGREDIENT_COLUMNS = ["Ingredient", "Quantity", "Unit", "Price per unit (INR)"]
 
@@ -45,11 +54,48 @@ _CALCULATOR_INPUT_KEYS = (
 )
 
 
-def _default_state_path():
-    env = os.environ.get("FOODFOUNDER_STATE_FILE", "").strip()
+def is_valid_session_id(value):
+    """Return True when ``value`` is a safe session id (no path traversal)."""
+    return isinstance(value, str) and bool(SESSION_ID_RE.match(value))
+
+
+def valid_session_id(value):
+    """Return the session id when valid, else None."""
+    if is_valid_session_id(value):
+        return value
+    return None
+
+
+def _sessions_dir():
+    env = os.environ.get("FOODFOUNDER_SESSIONS_DIR", "").strip()
     if env:
         return Path(env)
-    return Path(__file__).resolve().parent.parent / ".foodfounder_state.json"
+    return Path(__file__).resolve().parent.parent / ".foodfounder_sessions"
+
+
+def _state_path(sid):
+    return _sessions_dir() / f"{sid}.json"
+
+
+def _prune_sessions():
+    """Keep only the most recent MAX_SESSION_FILES session files."""
+    sessions_dir = _sessions_dir()
+    try:
+        files = [
+            entry
+            for entry in sessions_dir.iterdir()
+            if entry.is_file() and entry.suffix == ".json"
+        ]
+    except OSError:
+        return
+    if len(files) <= MAX_SESSION_FILES:
+        return
+    files.sort(key=lambda entry: entry.stat().st_mtime, reverse=True)
+    for entry in files[MAX_SESSION_FILES:]:
+        try:
+            entry.unlink()
+        except OSError:
+            pass
 
 
 def _is_finite_number(value):
@@ -281,9 +327,15 @@ def _load_chat_history(raw):
 # Public load / save
 # ---------------------------------------------------------------------------
 
-def load_state(path=None):
-    """Load and validate saved state. Returns a normalized dict; never raises."""
-    state_path = Path(path) if path else _default_state_path()
+def load_state(sid):
+    """Load and validate saved state for a session. Never raises.
+
+    An invalid/missing session id, or a missing/malformed file, yields empty
+    defaults so the session starts fresh.
+    """
+    if not is_valid_session_id(sid):
+        return _empty_state()
+    state_path = _state_path(sid)
     try:
         raw = state_path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
@@ -322,11 +374,17 @@ def has_content(data):
     )
 
 
-def save_state(data, path=None):
-    """Atomically save state. Returns True if written, False if skipped/failed."""
+def save_state(data, sid):
+    """Atomically save state for a session. Returns True if written.
+
+    Returns False (and writes nothing) when the session id is invalid or
+    there is nothing meaningful to store.
+    """
+    if not is_valid_session_id(sid):
+        return False
     if not has_content(data):
         return False
-    state_path = Path(path) if path else _default_state_path()
+    state_path = _state_path(sid)
     payload = {
         "version": SCHEMA_VERSION,
         "product": _dump_product(data.get("product")),
@@ -342,22 +400,24 @@ def save_state(data, path=None):
             json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
         )
         os.replace(tmp_path, state_path)
-        return True
     except OSError:
         return False
+    _prune_sessions()
+    return True
 
 
 # ---------------------------------------------------------------------------
 # Session-state bridge (used by app.py)
 # ---------------------------------------------------------------------------
 
-def restore_session_state(session_state, path=None):
-    """Populate ``session_state`` from the saved file (only missing keys).
+def restore_session_state(session_state, sid):
+    """Populate ``session_state`` from this session's saved file.
 
-    Existing session values are never overwritten, so a live session's newer
-    data always wins over an older file. Returns the loaded state dict.
+    Only missing keys are filled, so a live session's newer data always wins
+    over an older file. An invalid session id is a no-op (fresh session).
+    Returns the loaded state dict.
     """
-    saved = load_state(path)
+    saved = load_state(sid)
 
     product = saved.get("product")
     if product and "product" not in session_state:

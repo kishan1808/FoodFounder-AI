@@ -15,22 +15,23 @@ from services.ai_assistant import AssistantError
 
 APP_PATH = Path(__file__).resolve().parent.parent / "app.py"
 
+# Valid session id so AppTest behaves like a real post-bootstrap browser session.
+TEST_SID = "apptestchat-session-01"
 
-def isolate_state_file():
-    """Point the app's persistence at a fresh (nonexistent) temp file."""
-    fd, path = tempfile.mkstemp(suffix=".json", prefix="ff_test_chat_state_")
-    os.close(fd)
-    os.unlink(path)
-    os.environ["FOODFOUNDER_STATE_FILE"] = path
+
+def isolate_sessions_dir():
+    """Point the app's persistence at a fresh (empty) temp sessions dir."""
+    path = tempfile.mkdtemp(prefix="ff_test_chat_sessions_")
+    os.environ["FOODFOUNDER_SESSIONS_DIR"] = path
     return path
 
 
-def open_ai_page(state_path=None):
-    if state_path is not None:
-        os.environ["FOODFOUNDER_STATE_FILE"] = str(state_path)
-    else:
-        isolate_state_file()
+def open_ai_page(sid=TEST_SID, isolate=True):
+    if isolate:
+        isolate_sessions_dir()
     at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    if sid is not None:
+        at.query_params["sid"] = sid
     at.run()
     at.sidebar.radio[0].set_value("AI Guidance")
     at.run()

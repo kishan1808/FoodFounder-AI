@@ -11,15 +11,217 @@ st.set_page_config(
     layout="centered",
 )
 
-# Restore persisted state (product, calculator, chat) so a full browser
-# refresh does not lose data. Only fills keys that are missing, so a live
-# session's newer values always win over the saved file.
-try:
-    persistence.restore_session_state(st.session_state)
-except Exception:
-    pass
+# --- Session identity -------------------------------------------------------
+# Each browser tab session carries a stable id in the URL `sid` query param.
+# On a genuinely new session (no/invalid sid) a tiny inline script runs in the
+# MAIN document via st.html(..., unsafe_allow_javascript=True). This matters:
+# st.iframe content is sandboxed without `allow-top-navigation`, so Chrome
+# blocks the iframe's attempt to navigate the top window — the old approach
+# never added the sid and persistence never engaged. The script reads or
+# creates the id in the tab's sessionStorage and calls location.replace() once
+# with the sid added (replace, not assign, so the pre-sid URL stays out of the
+# history). Existing query params — including `page` — are preserved. A
+# redirect loop is impossible: the script only renders when the URL has no
+# valid sid, and after the replace the URL always has one (Python re-checks
+# with persistence.valid_session_id). A refresh keeps the URL (same sid ->
+# same saved data); a new tab has empty sessionStorage -> fresh sid -> fresh
+# data. Note: duplicating a tab clones sessionStorage, so a duplicate shares
+# the session's sid (browser behavior, documented rather than "fixed").
+SID_BOOTSTRAP_HTML = """
+<script>
+(function () {
+  var loc = window.location;
+  var params = new URLSearchParams(loc.search);
+  var current = params.get("sid");
+  if (current && /^[A-Za-z0-9_-]{16,64}$/.test(current)) { return; }
+  var sid = null;
+  try { sid = window.sessionStorage.getItem("ff_sid"); } catch (err) {}
+  if (!sid || !/^[A-Za-z0-9_-]{16,64}$/.test(sid)) {
+    sid = (window.crypto && window.crypto.randomUUID)
+      ? window.crypto.randomUUID()
+      : "s" + Date.now().toString(36) + Math.random().toString(36).slice(1, 12);
+    try { window.sessionStorage.setItem("ff_sid", sid); } catch (err) {}
+  }
+  params.set("sid", sid);
+  loc.replace(loc.pathname + "?" + params.toString() + loc.hash);
+})();
+</script>
+"""
 
-PAGES = ["Home / Product Setup", "Cost Calculator", "AI Guidance"]
+SESSION_ID = persistence.valid_session_id(st.query_params.get("sid"))
+if SESSION_ID is None:
+    # Pre-session render: no restore, no save. The script above navigates
+    # once with a fresh sid, after which this branch is not taken again.
+    st.html(SID_BOOTSTRAP_HTML, unsafe_allow_javascript=True)
+else:
+    # Restore this session's persisted data (only fills missing keys).
+    try:
+        persistence.restore_session_state(st.session_state, SESSION_ID)
+    except Exception:
+        pass
+
+# --- Light / Dark theme ------------------------------------------------------
+# The sidebar toggle writes st.session_state["theme_dark"]; every rerun
+# rebuilds one CSS block from the matching palette below. Overriding
+# Streamlit's own theme CSS variables (background/secondary/primary/text)
+# retints widgets, inputs, and buttons consistently, with extra selectors
+# for cards, chat bubbles, metrics, tables, and expanders. The choice lives
+# in session_state, so it survives navigation and ordinary reruns without
+# touching product data, calculations, or chat; a toggle rerun never changes
+# the page, so the scroll-to-top gate never fires.
+THEME_PALETTES = {
+    "light": {
+        "bg": "#f4f8f4",
+        "secondary": "#ffffff",
+        "text": "#17251a",
+        "muted": "#4a5d4e",
+        "primary": "#2e7d32",
+        "primary_text": "#ffffff",
+        "border": "#d5e3d7",
+        "card": "#ffffff",
+        "chat": "#eef6ef",
+        "hover": "#e6f1e7",
+    },
+    "dark": {
+        "bg": "#0d1410",
+        "secondary": "#152019",
+        "text": "#e4f0e6",
+        "muted": "#9db8a3",
+        "primary": "#66bb6a",
+        "primary_text": "#0d1410",
+        "border": "#2b3d31",
+        "card": "#152019",
+        "chat": "#1c2a20",
+        "hover": "#24382a",
+    },
+}
+
+THEME_CSS_TEMPLATE = """
+<style id="ff-theme" data-mode="__MODE__">
+:root {{
+  --background-color: {bg};
+  --secondary-background-color: {secondary};
+  --primary-color: {primary};
+  --text-color: {text};
+}}
+html, body,
+[data-testid="stAppViewContainer"],
+.main .block-container,
+section.stMain {{
+  background-color: {bg} !important;
+  color: {text};
+}}
+[data-testid="stSidebar"] {{
+  background-color: {secondary} !important;
+  border-right: 1px solid {border};
+}}
+[data-testid="stSidebar"] .stMarkdown,
+[data-testid="stSidebar"] p,
+[data-testid="stSidebar"] label,
+[data-testid="stSidebar"] h1,
+[data-testid="stSidebar"] h2 {{ color: {text}; }}
+h1, h2, h3, h4, h5, h6,
+p, li, label, .stMarkdown, .stCaption {{ color: {text}; }}
+div[data-testid="stButton"] > button {{
+  background-color: {secondary};
+  color: {text};
+  border: 1px solid {border};
+  border-radius: 8px;
+  transition: border-color 0.15s ease, color 0.15s ease;
+}}
+div[data-testid="stButton"] > button:hover {{
+  border-color: {primary};
+  color: {primary};
+  background-color: {hover};
+}}
+div[data-testid="stButton"] > button[kind="primary"] {{
+  background-color: {primary};
+  color: {primary_text};
+  border: 1px solid {primary};
+}}
+div[data-testid="stButton"] > button[kind="primary"]:hover {{
+  background-color: {primary};
+  color: {primary_text};
+  opacity: 0.92;
+}}
+[data-testid="stTextInput"] input,
+[data-testid="stNumberInput"] input,
+[data-testid="stTextArea"] textarea,
+[data-testid="stSelectbox"] [data-baseweb="select"],
+[data-testid="stDateInput"] input,
+[data-testid="stChatInput"] {{
+  background-color: {secondary};
+  color: {text};
+  border: 1px solid {border};
+}}
+[data-testid="stTextInput"] input:focus,
+[data-testid="stNumberInput"] input:focus,
+[data-testid="stTextArea"] textarea:focus {{
+  border-color: {primary};
+  color: {text};
+}}
+[data-testid="stChatInput"] textarea {{ background: transparent; color: {text}; }}
+[data-testid="stChatInput"] button {{ color: {muted}; }}
+[data-testid="stChatInput"] button:hover {{ color: {primary}; }}
+div[data-testid="stExpander"] {{
+  background-color: {card};
+  border: 1px solid {border};
+  border-radius: 10px;
+}}
+[data-testid="stChatMessage"] {{
+  background-color: {chat};
+  border: 1px solid {border};
+  border-radius: 12px;
+  padding: 10px 14px;
+}}
+[data-testid="stChatMessage"] * {{ color: {text}; }}
+[data-testid="stMetric"] {{
+  background-color: {card};
+  border: 1px solid {border};
+  border-radius: 10px;
+  padding: 12px 16px;
+}}
+[data-testid="stMetricLabel"] {{ color: {muted}; }}
+[data-testid="stMetricValue"] {{ color: {text}; }}
+[data-testid="stMetricDelta"] {{ color: {primary}; }}
+[data-testid="stDataFrame"],
+div[data-testid="st.data_editor"],
+div[data-testid="st.dataframe"] {{
+  background-color: {secondary};
+  border: 1px solid {border};
+  border-radius: 10px;
+}}
+[data-testid="stPlotlyChart"],
+[data-testid="stAltairChart"] {{
+  background-color: {secondary};
+  border: 1px solid {border};
+  border-radius: 10px;
+}}
+[data-baseweb="tab"] {{ color: {muted}; }}
+[data-baseweb="tab"][aria-selected="true"] {{
+  color: {primary};
+  border-bottom-color: {primary};
+}}
+[data-baseweb="tab-list"] {{ background-color: {secondary}; border-radius: 8px; }}
+.stRadio label, .stToggle label {{ color: {text}; }}
+[data-testid="stDivider"] hr {{ border-color: {border}; }}
+</style>
+"""
+
+
+def build_theme_css(mode):
+    """Return the themed CSS block for 'light' or 'dark'."""
+    palette = THEME_PALETTES["dark" if mode == "dark" else "light"]
+    return THEME_CSS_TEMPLATE.replace("__MODE__", mode).format(**palette)
+
+
+st.session_state.setdefault("theme_dark", False)
+st.markdown(
+    build_theme_css("dark" if st.session_state["theme_dark"] else "light"),
+    unsafe_allow_html=True,
+)
+
+PAGES = ["Home", "Cost Calculator", "AI Guidance", "Product Development"]
 
 PRODUCT_CATEGORIES = [
     "Snacks",
@@ -73,6 +275,46 @@ def build_pdf_summary(product, result):
         )
     except Exception:
         return None
+
+
+def render_summary_section(product, result, key_prefix, heading=None, with_preview=False):
+    """Shared Product Development summary block (Markdown + optional PDF).
+
+    Used by the Cost Calculator (after a run) and by the Product Development
+    page so the implementation lives in one place.
+    """
+    if heading:
+        st.markdown(heading)
+    summary_text = report.build_report(
+        product=product,
+        result=result,
+        chat_history=st.session_state.get("chat_history"),
+    )
+    summary_pdf = build_pdf_summary(product, result)
+    if summary_pdf is not None:
+        st.download_button(
+            "📄 Download product development summary (PDF)",
+            data=summary_pdf,
+            file_name="foodfounder_summary.pdf",
+            mime="application/pdf",
+            key=f"download_report_pdf_{key_prefix}",
+            type="primary",
+            width="stretch",
+        )
+    else:
+        st.caption("PDF export is unavailable in this session; Markdown download is below.")
+    st.download_button(
+        "📥 Download product development summary (Markdown)",
+        data=summary_text,
+        file_name="foodfounder_summary.md",
+        mime="text/markdown",
+        key=f"download_report_{key_prefix}",
+        width="stretch",
+    )
+    if with_preview:
+        with st.expander("Preview summary"):
+            st.markdown(summary_text)
+    return summary_text
 
 
 def page_home():
@@ -356,32 +598,7 @@ def page_calculator():
                 """
             )
 
-        summary_text = report.build_report(
-            product=product,
-            result=result,
-            chat_history=st.session_state.get("chat_history"),
-        )
-        summary_pdf = build_pdf_summary(product, result)
-        if summary_pdf is not None:
-            st.download_button(
-                "📄 Download product development summary (PDF)",
-                data=summary_pdf,
-                file_name="foodfounder_summary.pdf",
-                mime="application/pdf",
-                key="download_report_pdf_calculator",
-                type="primary",
-                width="stretch",
-            )
-        else:
-            st.caption("PDF export is unavailable in this session; Markdown download is below.")
-        st.download_button(
-            "📥 Download product development summary (Markdown)",
-            data=summary_text,
-            file_name="foodfounder_summary.md",
-            mime="text/markdown",
-            key="download_report_calculator",
-            width="stretch",
-        )
+        render_summary_section(product, result, key_prefix="calculator")
 
 
 def page_ai():
@@ -515,36 +732,27 @@ def page_ai():
         )
         st.markdown(guidance.resources_as_markdown())
 
+
+def page_product_development():
+    st.title("📄 Product Development")
+    st.caption(
+        "Download a development summary built from your product setup, "
+        "latest cost estimate, and AI guidance conversation."
+    )
+    product = st.session_state.get("product")
+    result = st.session_state.get("cost_result")
+    if not product:
+        st.info("No product set yet — add your basics on the Home page for a fuller summary.")
+    if not result:
+        st.info("No cost estimate yet — run the Cost Calculator for a fuller summary.")
     st.divider()
-    st.markdown("### 📄 Product development summary")
-    summary_text = report.build_report(
-        product=product,
-        result=result,
-        chat_history=st.session_state.get("chat_history"),
+    render_summary_section(
+        product,
+        result,
+        key_prefix="product",
+        heading="### 📄 Product development summary",
+        with_preview=True,
     )
-    summary_pdf = build_pdf_summary(product, result)
-    if summary_pdf is not None:
-        st.download_button(
-            "📄 Download summary (PDF)",
-            data=summary_pdf,
-            file_name="foodfounder_summary.pdf",
-            mime="application/pdf",
-            key="download_report_pdf_ai",
-            type="primary",
-            width="stretch",
-        )
-    else:
-        st.caption("PDF export is unavailable in this session; Markdown download is below.")
-    st.download_button(
-        "📥 Download summary (Markdown)",
-        data=summary_text,
-        file_name="foodfounder_summary.md",
-        mime="text/markdown",
-        key="download_report_ai",
-        width="stretch",
-    )
-    with st.expander("Preview summary"):
-        st.markdown(summary_text)
 
 
 # --- Navigation (URL query param keeps the page across browser refresh) ---
@@ -579,6 +787,11 @@ page = st.sidebar.radio(
     label_visibility="collapsed",
     on_change=_sync_nav_to_url,
 )
+st.sidebar.toggle(
+    "🌙 Dark mode",
+    key="theme_dark",
+    help="Switch the app between light and dark themes",
+)
 st.sidebar.divider()
 product = st.session_state.get("product")
 if product:
@@ -590,32 +803,130 @@ if st.query_params.get("page") != page:
     st.session_state["_nav_url_seen"] = page
 
 # One-shot scroll-to-top when (and only when) the page actually changes.
-# Streamlit never resets browser scroll on reruns or page changes (reruns
-# patch the DOM in place and page switches use history.pushState), so the
-# browser keeps the old scroll offset when switching pages — e.g. Cost
-# Calculator -> AI Guidance opened near the bottom of the new page.
-# st.html(..., unsafe_allow_javascript=True) is a first-class, non-iframed
-# Streamlit API that executes the script once. The gate keeps mid-task
-# reruns (calculate, save, chat) from scrolling, and setdefault leaves the
-# session's first run alone (fresh load is already at the top; a browser
-# refresh keeps its native scroll restore).
+# Streamlit 1.65 does not scroll the browser window: the app content lives
+# in an inner <section> with class="stMain" (height:100dvh, overflow:auto),
+# so window.scrollTo() is a no-op there (the reason the earlier st.html fix
+# failed in a real browser). The data-testid attribute of that <section>
+# flips between "stMain" and "stAppScrollToBottomContainer" (when the page
+# contains a bottom-anchored st.chat_input, as on AI Guidance), so we select
+# by the stable CSS class "section.stMain" first and fall back to both
+# data-testid values. On AI Guidance, Streamlit scrolls the chat input into
+# view ~0.5s AFTER mount and would override an immediate reset, so that
+# page's script schedules ONE extra reset 1s later (a single setTimeout —
+# never a loop — so ordinary scrolling, chat, and calculations are never
+# fought). The gate keeps mid-task reruns from ever emitting the script, and
+# setdefault leaves the session's first run alone.
+SCROLL_TO_TOP_TEMPLATE = (
+    "<script>(function(){"
+    "var w = window.parent;"
+    "function target(){"
+    "return w.document.querySelector("
+    "'section.stMain, [data-testid=\"stMain\"], [data-testid=\"stAppScrollToBottomContainer\"]'"
+    ");"
+    "}"
+    "function reset(){"
+    "try { w.scrollTo(0, 0); } catch (e) {}"
+    "var m = target();"
+    "if (m) { m.scrollTop = 0; }"
+    "}"
+    "__ACTION__"
+    "})();</script>"
+    "<!-- ff-nav: __PAGE__ -->"
+)
+
+
+def scroll_to_top_html(page):
+    if page == "AI Guidance":
+        # Root cause of the bottom-then-top flicker (verified in Chrome via
+        # scrollTop-setter + stack instrumentation): at mount, Streamlit's
+        # bundle starts a requestAnimationFrame easing loop that writes
+        # section.scrollTop each frame to reveal the chat input
+        # (index.CKCTizkM.js — cancelAnimationFrame chain, cancelled only by
+        # real pointerdown/wheel on the section). Our iframe script runs a
+        # frame after their loop starts, so we: (1) dispatch a synthetic
+        # pointerdown on the section to trigger THEIR OWN cancel path
+        # (listener is attached in the same layout effect that starts the
+        # loop, so it is always in place before our script runs); (2) keep a
+        # short scrollTop-setter trap as defense-in-depth during the mount
+        # window so nothing can paint the page away from the top; (3) the
+        # trap removes itself on user interaction or one cleanup timeout —
+        # never a scroll loop; mid-task reruns never emit this script.
+        action = (
+            "var touched = false;"
+            "var m = target();"
+            "var untrap = function(){};"
+            "if (m) {"
+            "var proto = Object.getOwnPropertyDescriptor(w.Element.prototype, 'scrollTop');"
+            "var origRAF = w.requestAnimationFrame;"
+            "var origCAF = w.cancelAnimationFrame;"
+            "var lastId = null, tried = false;"
+            "w.requestAnimationFrame = function(cb){"
+            "var id = origRAF.call(w, function(ts){"
+            "tried = false;"
+            "var r = cb(ts);"
+            "if (tried && lastId !== null) { origCAF.call(w, lastId); lastId = null; }"
+            "return r;"
+            "});"
+            "lastId = id;"
+            "return id;"
+            "};"
+            "untrap = function(){"
+            "try { delete m.scrollTop; } catch (e) {}"
+            "w.requestAnimationFrame = origRAF;"
+            "w.cancelAnimationFrame = origCAF;"
+            "};"
+            "Object.defineProperty(m, 'scrollTop', {"
+            "get: function(){ return proto.get.call(this); },"
+            "set: function(x){"
+            "if (touched) { untrap(); return proto.set.call(this, x); }"
+            "tried = true;"
+            "return proto.set.call(this, 0);"
+            "},"
+            "configurable: true"
+            "});"
+            "try {"
+            "m.dispatchEvent(new w.PointerEvent('pointerdown',"
+            "{bubbles: true, cancelable: true, pointerId: 1}));"
+            "} catch (e) {}"
+            "}"
+            "try {"
+            "['wheel','touchmove','keydown'].forEach(function(ev){"
+            "w.addEventListener(ev, function(){ touched = true; untrap(); }, {passive: true});"
+            "});"
+            "} catch (e) {}"
+            "reset();"
+            "setTimeout(untrap, 1500);"
+        )
+    else:
+        action = "reset();"
+    return SCROLL_TO_TOP_TEMPLATE.replace("__ACTION__", action).replace("__PAGE__", page)
+
+
+# A session whose FIRST run lands directly on AI Guidance (?page= URL,
+# browser refresh) never triggers the page-change gate below, leaving
+# Streamlit's chat-input mount scroll unopposed (lands at the bottom).
+# Emit the AI mount guard on that first run too; other pages' first runs
+# stay untouched (they have no mount scroll).
+_scrolled_first_run = "_scrolled_page" not in st.session_state
 st.session_state.setdefault("_scrolled_page", page)
-if st.session_state["_scrolled_page"] != page:
-    st.html(
-        f"<script>window.scrollTo(0, 0); /* nav:{page} */</script>",
-        unsafe_allow_javascript=True,
-    )
+if st.session_state["_scrolled_page"] != page or (_scrolled_first_run and page == "AI Guidance"):
+    st.iframe(scroll_to_top_html(page), height=1)
     st.session_state["_scrolled_page"] = page
 
-if page == "Home / Product Setup":
+if page == "Home":
     page_home()
 elif page == "Cost Calculator":
     page_calculator()
-else:
+elif page == "AI Guidance":
     page_ai()
+else:
+    page_product_development()
 
-# --- Persist state so a browser refresh can restore it ---
-try:
-    persistence.save_state(persistence.capture_session_state(st.session_state))
-except Exception:
-    pass
+# --- Persist state so a browser refresh of this session can restore it ---
+if SESSION_ID is not None:
+    try:
+        persistence.save_state(
+            persistence.capture_session_state(st.session_state), SESSION_ID
+        )
+    except Exception:
+        pass
